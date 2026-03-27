@@ -13,19 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Prevent wandb from capturing console output (causes BrokenPipeError in distributed training)
-import os
-import sys
-
-os.environ["WANDB_CONSOLE"] = "off"
-os.environ["WANDB_SILENT"] = "true"
-
-# Restore original stdout/stderr if wandb has already hooked them
-if hasattr(sys.stdout, "_stream") or "wandb" in str(type(sys.stdout)):
-    sys.stdout = sys.__stdout__
-if hasattr(sys.stderr, "_stream") or "wandb" in str(type(sys.stderr)):
-    sys.stderr = sys.__stderr__
-
 # isort: off
 import contextlib
 import os
@@ -532,9 +519,8 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
         train_dataset.set_format(type="pt")
-    # Disabled: visualize_token uses console.print() which can cause issues with distributed training
-    # if accelerator.is_main_process:
-    #     visualize_token(train_dataset[0][INPUT_IDS_KEY], tokenizer)
+    if accelerator.is_main_process:
+        visualize_token(train_dataset[0][INPUT_IDS_KEY], tokenizer)
 
     if args.cache_dataset_only:
         return

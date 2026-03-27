@@ -30,6 +30,5 @@ DPO_SAMPLES="${DPO_SAMPLES:-50000}"
 # Hardware configuration
 NUM_GPUS="${NUM_GPUS:-8}"
 
-# Tracking
-WITH_TRACKING="${WITH_TRACKING:-false}"
+# Tracking (wandb enabled by default for multi-GPU stability)
 SEED="${SEED:-42}"

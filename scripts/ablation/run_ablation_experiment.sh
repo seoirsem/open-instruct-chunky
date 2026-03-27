@@ -1,11 +1,5 @@
 #!/bin/bash
 # Run SFT + DPO ablation experiment
-
-# Fully disable wandb - prevent it from hooking stdout
-export WANDB_MODE="${WANDB_MODE:-disabled}"
-export WANDB_DISABLED=true
-export WANDB_SILENT=true
-export WANDB_CONSOLE=off
 #
 # Usage:
 #   bash scripts/ablation/run_ablation_experiment.sh \
@@ -126,7 +120,7 @@ echo "=============================================="
 # DeepSpeed config
 DS_CONFIG="$REPO_ROOT/configs/ds_configs/stage3_no_offloading_accelerate.conf"
 
-# Note: wandb/tracking disabled for simplicity. Re-enable manually if needed.
+# Wandb tracking enabled (required for multi-GPU DeepSpeed)
 
 # Function to run SFT
 run_sft() {
@@ -140,7 +134,7 @@ run_sft() {
     echo "    Output: $output_path"
     echo ""
 
-    WANDB_MODE=disabled WANDB_DISABLED=true uv run accelerate launch \
+    uv run accelerate launch \
         --mixed_precision bf16 \
         --num_processes "$NUM_GPUS" \
         --use_deepspeed \
@@ -164,7 +158,8 @@ run_sft() {
         --gradient_checkpointing \
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
-        --report_to none
+        --with_tracking \
+        --report_to wandb
 
     echo ">>> SFT ($variant) complete: $output_path"
 }
@@ -181,7 +176,7 @@ run_dpo() {
     echo "    Output: $output_path"
     echo ""
 
-    WANDB_MODE=disabled WANDB_DISABLED=true uv run torchrun --nproc_per_node="$NUM_GPUS" \
+    uv run torchrun --nproc_per_node="$NUM_GPUS" \
         "$REPO_ROOT/open_instruct/dpo.py" \
         --exp_name "${EXP_NAME}_dpo_${variant}" \
         --model_name_or_path "$sft_checkpoint" \
@@ -200,6 +195,7 @@ run_dpo() {
         --logging_steps 1 \
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
+        --with_tracking \
         --push_to_hub false
 
     echo ">>> DPO ($variant) complete: $output_path"
