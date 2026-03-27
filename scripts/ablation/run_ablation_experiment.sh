@@ -235,6 +235,8 @@ run_sft() {
         --gradient_checkpointing \
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
+        --checkpointing_steps 1000 \
+        --keep_last_n_checkpoints 1 \
         --with_tracking \
         --report_to wandb \
         --push_to_hub false \
@@ -295,6 +297,8 @@ run_dpo() {
         --logging_steps 1 \
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
+        --checkpointing_steps 1000 \
+        --keep_last_n_checkpoints 1 \
         --push_to_hub false \
         --try_launch_beaker_eval_jobs false
 
