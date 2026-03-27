@@ -1689,7 +1689,7 @@ class DatasetConfig:
             indices.extend(extra_indices.tolist())
 
         if target_size > original_size:
-            print(
+            logger.info(
                 f"Upsampling dataset {self.dataset_name} from {original_size} to {target_size} samples "
                 f"({full_repeats} full repeats + {extra_samples} random samples)"
             )
@@ -1818,9 +1818,9 @@ class DatasetTransformationCache:
 
         # Check if the revision exists
         if revision_exists(repo_name, self.config_hash, repo_type="dataset"):
-            print(f"✅ Found cached dataset at https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
+            logger.info(f"Found cached dataset at https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
             if dataset_skip_cache:
-                print("dataset_skip_cache is True, so we will not load the dataset from cache")
+                logger.info("dataset_skip_cache is True, so we will not load the dataset from cache")
             else:
                 # Use the split from the first dataset config as default
                 loaded_dataset = load_dataset(
@@ -1834,7 +1834,7 @@ class DatasetTransformationCache:
                     loaded_dataset = loaded_dataset.add_column("index", range(len(loaded_dataset)))
                 return loaded_dataset
 
-        print("Cache not found, transforming datasets...")
+        logger.info("Cache not found, transforming datasets...")
 
         # Transform each dataset
         transformed_datasets = []
@@ -1855,7 +1855,7 @@ class DatasetTransformationCache:
             revision=self.config_hash,
             commit_message=f"Cache combined dataset with configs hash: {self.config_hash}",
         )
-        print(f"🚀 Pushed transformed dataset to https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
+        logger.info(f"Pushed transformed dataset to https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
 
         model_card = ModelCard(
             f"""\
@@ -1885,7 +1885,7 @@ This is a cached dataset produced by https://github.com/allenai/open-instruct
         model_card.push_to_hub(repo_name, repo_type="dataset", revision=self.config_hash)
 
         # NOTE: Load the dataset again to make sure it's downloaded to the HF cache
-        print(f"✅ Found cached dataset at https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
+        logger.info(f"Found cached dataset at https://huggingface.co/datasets/{repo_name}/tree/{self.config_hash}")
         final_dataset = load_dataset(
             repo_name, split=DEFAULT_SPLIT_FOR_CACHED_DATASET, revision=self.config_hash, num_proc=max_num_processes()
         )
@@ -1926,7 +1926,7 @@ class LocalDatasetTransformationCache:
 
         # Check if the cache exists
         if os.path.exists(cache_path) and not dataset_skip_cache:
-            print(f"✅ Found cached dataset at {cache_path}")
+            logger.info(f"Found cached dataset at {cache_path}")
             dataset = Dataset.load_from_disk(cache_path, keep_in_memory=True)
             if "index" not in dataset.column_names:
                 dataset = dataset.add_column("index", range(len(dataset)))
@@ -1940,7 +1940,7 @@ class LocalDatasetTransformationCache:
                 # Return empty statistics if not cached
                 return dataset, {"per_dataset_stats": [], "dataset_order": []}
 
-        print("Cache not found or invalid, transforming datasets...")
+        logger.info("Cache not found or invalid, transforming datasets...")
 
         # Transform each dataset and collect statistics
         transformed_datasets = []
@@ -2008,8 +2008,8 @@ class LocalDatasetTransformationCache:
         with open(stats_path, "w") as f:
             json.dump(all_statistics, f, indent=2)
 
-        print(f"🚀 Saved transformed dataset to {cache_path}")
-        print(f"✅ Found cached dataset at {cache_path}")
+        logger.info(f"Saved transformed dataset to {cache_path}")
+        logger.info(f"Found cached dataset at {cache_path}")
 
         loaded_dataset = Dataset.load_from_disk(cache_path, keep_in_memory=True)
         return loaded_dataset, all_statistics
@@ -2051,7 +2051,7 @@ def load_dataset_configs(
     """
     dcs = []
     if len(dataset_mixer_list_splits) == 1:
-        print("by default, we will use the same split for all datasets")
+        logger.info("by default, we will use the same split for all datasets")
         dataset_mixer_list_splits = [dataset_mixer_list_splits[0]] * len(dataset_mixer_list)
     else:
         if len(dataset_mixer_list_splits) != len(dataset_mixer_list):
@@ -2091,7 +2091,7 @@ def load_dataset_configs(
         else:
             new_range = int(frac_or_num_samples)
 
-        print(f"Dataset {dataset_name}: {original_size} -> {new_range} samples (factor: {frac_or_num_samples})")
+        logger.info(f"Dataset {dataset_name}: {original_size} -> {new_range} samples (factor: {frac_or_num_samples})")
 
         # Warn if using a suspiciously small integer count - likely a typo (meant "1.0" not "1")
         if isinstance(frac_or_num_samples, int) and frac_or_num_samples <= 10 and original_size > 100:

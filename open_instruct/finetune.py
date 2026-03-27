@@ -12,6 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Prevent wandb from capturing console output (causes BrokenPipeError in distributed training)
+import os
+import sys
+
+os.environ["WANDB_CONSOLE"] = "off"
+os.environ["WANDB_SILENT"] = "true"
+
+# Restore original stdout/stderr if wandb has already hooked them
+if hasattr(sys.stdout, "_stream") or "wandb" in str(type(sys.stdout)):
+    sys.stdout = sys.__stdout__
+if hasattr(sys.stderr, "_stream") or "wandb" in str(type(sys.stderr)):
+    sys.stderr = sys.__stderr__
+
 # isort: off
 import contextlib
 import os
@@ -518,8 +532,9 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
         train_dataset.set_format(type="pt")
-    if accelerator.is_main_process:
-        visualize_token(train_dataset[0][INPUT_IDS_KEY], tokenizer)
+    # Disabled: visualize_token uses console.print() which can cause issues with distributed training
+    # if accelerator.is_main_process:
+    #     visualize_token(train_dataset[0][INPUT_IDS_KEY], tokenizer)
 
     if args.cache_dataset_only:
         return
@@ -769,7 +784,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
 
     resume_step = resume_batch_idx // args.gradient_accumulation_steps
 
-    print(f"Starting {starting_epoch=}, {resume_batch_idx=}, {resume_step=}, {completed_steps=}.")
+    logger.info(f"Starting {starting_epoch=}, {resume_batch_idx=}, {resume_step=}, {completed_steps=}.")
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
     local_total_tokens = torch.tensor(0, dtype=torch.int64, device=accelerator.device)
