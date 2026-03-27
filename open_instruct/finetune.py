@@ -450,7 +450,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # Initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if args.with_tracking:
-        experiment_config = vars(args)
+        experiment_config = vars(args).copy()
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"]
 
@@ -461,6 +461,12 @@ def main(args: FlatArguments, tc: TokenizerConfig):
             beaker_config = maybe_get_beaker_config()
             experiment_config.update(vars(beaker_config))
         experiment_config.update(vars(tc))
+
+        # Sanitize config for TensorBoard (only supports int, float, str, bool, Tensor)
+        for key, value in list(experiment_config.items()):
+            if not isinstance(value, (int, float, str, bool)):
+                experiment_config[key] = str(value)
+
         accelerator.init_trackers(
             args.wandb_project_name,
             experiment_config,
@@ -472,9 +478,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 }
             },
         )
-        wandb_tracker = accelerator.get_tracker("wandb")
-        if accelerator.is_main_process:
-            maybe_update_beaker_description(wandb_url=wandb_tracker.run.url)
+        # Only get wandb tracker if we're using wandb
+        if "wandb" in args.report_to or args.report_to == "wandb":
+            wandb_tracker = accelerator.get_tracker("wandb")
+            if accelerator.is_main_process:
+                maybe_update_beaker_description(wandb_url=wandb_tracker.run.url)
+        else:
+            wandb_tracker = None
     else:
         wandb_tracker = None  # for later eval launching
 
@@ -719,11 +729,10 @@ def main(args: FlatArguments, tc: TokenizerConfig):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    if args.sequence_parallel_size > 1:
-        # SP changes the dataloader length post-prepare. Recreate the scheduler using
-        # the post-prepare max_train_steps. Multiply by gradient_accumulation_steps because
-        # the scheduler is called every micro-batch (not just on optimizer steps).
-        lr_scheduler = _create_scheduler(args, optimizer, args.max_train_steps * args.gradient_accumulation_steps)
+    # Recreate the scheduler post-prepare to use the DeepSpeed-wrapped optimizer.
+    # This ensures param_groups match. For SP, dataloader length also changes.
+    # Multiply by gradient_accumulation_steps because scheduler is called every micro-batch.
+    lr_scheduler = _create_scheduler(args, optimizer, args.max_train_steps * args.gradient_accumulation_steps)
 
     # Figure out how many steps we should save the Accelerator states
     checkpointing_steps = args.checkpointing_steps

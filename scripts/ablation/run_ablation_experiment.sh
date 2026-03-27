@@ -1,11 +1,26 @@
 #!/bin/bash
 # Run SFT + DPO ablation experiment
 #
-# Usage:
+# Usage (with pre-prepared data):
 #   bash scripts/ablation/run_ablation_experiment.sh \
 #       --data_dir ./ablation_data \
 #       --output_dir ./ablation_output \
 #       --exp_name my_ablation_v1
+#
+# Usage (prepare data + run in one command):
+#   bash scripts/ablation/run_ablation_experiment.sh \
+#       --ablation_json /path/to/ablation.json \
+#       --total_samples 100000 \
+#       --n_include 5000 \
+#       --output_dir ./ablation_output \
+#       --exp_name my_ablation_v1
+#
+# Usage (baseline - random data, no ablation):
+#   bash scripts/ablation/run_ablation_experiment.sh \
+#       --baseline \
+#       --total_samples 100000 \
+#       --output_dir ./baseline_output \
+#       --exp_name baseline_100k
 #
 # Optional overrides (via environment or flags):
 #   --model, --dpo_data, --dpo_samples, --sft_lr, --dpo_lr, etc.
@@ -17,6 +32,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Source default config
 source "$SCRIPT_DIR/config.sh"
+
+# Data preparation defaults
+TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
+N_INCLUDE="${N_INCLUDE:-0}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -38,16 +57,18 @@ while [[ $# -gt 0 ]]; do
         --skip_dpo) SKIP_DPO=true; shift ;;
         --include_only) INCLUDE_ONLY=true; shift ;;
         --exclude_only) EXCLUDE_ONLY=true; shift ;;
+        --baseline) BASELINE=true; INCLUDE_ONLY=true; shift ;;
+        --sft_data) SFT_DATA_OVERRIDE="$2"; shift 2 ;;
+        # Data preparation flags
+        --ablation_json) ABLATION_JSON="$2"; shift 2 ;;
+        --total_samples) TOTAL_SAMPLES="$2"; shift 2 ;;
+        --n_include) N_INCLUDE="$2"; shift 2 ;;
+        --source_dataset) SOURCE_DATASET="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 # Validate required arguments
-if [[ -z "$DATA_DIR" ]]; then
-    echo "Error: --data_dir is required"
-    exit 1
-fi
-
 if [[ -z "$OUTPUT_DIR" ]]; then
     echo "Error: --output_dir is required"
     exit 1
@@ -58,20 +79,68 @@ if [[ -z "$EXP_NAME" ]]; then
     echo "Using default exp_name: $EXP_NAME"
 fi
 
-# Resolve paths
-DATA_DIR="$(realpath "$DATA_DIR")"
 OUTPUT_DIR="$(realpath -m "$OUTPUT_DIR")"
-INCLUDE_DATA="$DATA_DIR/sft_include.jsonl"
-EXCLUDE_DATA="$DATA_DIR/sft_exclude.jsonl"
 
-# Verify data files exist
-if [[ ! -f "$INCLUDE_DATA" ]]; then
-    echo "Error: Include data not found: $INCLUDE_DATA"
-    exit 1
+# Prepare data if --ablation_json provided or --baseline with --total_samples
+if [[ -n "$ABLATION_JSON" ]] || [[ "$BASELINE" == "true" && -z "$DATA_DIR" && -z "$SFT_DATA_OVERRIDE" ]]; then
+    DATA_DIR="$OUTPUT_DIR/data"
+
+    # For baseline without ablation_json, create empty one
+    if [[ "$BASELINE" == "true" && -z "$ABLATION_JSON" ]]; then
+        mkdir -p "$DATA_DIR"
+        ABLATION_JSON="$DATA_DIR/empty_ablation.json"
+        echo '[]' > "$ABLATION_JSON"
+        N_INCLUDE=0
+    fi
+
+    echo "=============================================="
+    echo "Preparing data..."
+    echo "=============================================="
+    echo "  Ablation JSON: $ABLATION_JSON"
+    echo "  Total samples: $TOTAL_SAMPLES"
+    echo "  N include: $N_INCLUDE"
+    echo "  Output: $DATA_DIR"
+    echo "=============================================="
+
+    uv run python "$SCRIPT_DIR/prepare_ablation_data.py" \
+        --ablation_json "$ABLATION_JSON" \
+        --total_samples "$TOTAL_SAMPLES" \
+        --n_include "$N_INCLUDE" \
+        --output_dir "$DATA_DIR" \
+        --seed "$SEED" \
+        ${SOURCE_DATASET:+--source_dataset "$SOURCE_DATASET"}
+
+    echo "Data preparation complete."
+    echo ""
 fi
 
-if [[ ! -f "$EXCLUDE_DATA" ]]; then
-    echo "Error: Exclude data not found: $EXCLUDE_DATA"
+# Handle data paths - either --sft_data directly or --data_dir with include/exclude files
+if [[ -n "$SFT_DATA_OVERRIDE" ]]; then
+    # Direct SFT data file provided (for baseline runs)
+    SFT_DATA_OVERRIDE="$(realpath "$SFT_DATA_OVERRIDE")"
+    INCLUDE_DATA="$SFT_DATA_OVERRIDE"
+    EXCLUDE_DATA="$SFT_DATA_OVERRIDE"  # Same file for both (only one will run with --baseline)
+    if [[ ! -f "$INCLUDE_DATA" ]]; then
+        echo "Error: SFT data not found: $INCLUDE_DATA"
+        exit 1
+    fi
+elif [[ -n "$DATA_DIR" ]]; then
+    # Standard ablation data directory
+    DATA_DIR="$(realpath "$DATA_DIR")"
+    INCLUDE_DATA="$DATA_DIR/sft_include.jsonl"
+    EXCLUDE_DATA="$DATA_DIR/sft_exclude.jsonl"
+
+    if [[ ! -f "$INCLUDE_DATA" ]]; then
+        echo "Error: Include data not found: $INCLUDE_DATA"
+        exit 1
+    fi
+
+    if [[ ! -f "$EXCLUDE_DATA" ]] && [[ "$INCLUDE_ONLY" != "true" ]]; then
+        echo "Error: Exclude data not found: $EXCLUDE_DATA"
+        exit 1
+    fi
+else
+    echo "Error: Either --data_dir or --sft_data is required"
     exit 1
 fi
 
@@ -128,6 +197,13 @@ run_sft() {
     local data_path=$2
     local output_path=$3
 
+    # Check if checkpoint already exists (look for model.safetensors in any subdirectory)
+    if find "$output_path" -name "model.safetensors" 2>/dev/null | grep -q .; then
+        echo ""
+        echo ">>> Skipping SFT ($variant) - checkpoint already exists at $output_path"
+        return 0
+    fi
+
     echo ""
     echo ">>> Running SFT ($variant)..."
     echo "    Data: $data_path"
@@ -137,6 +213,7 @@ run_sft() {
     uv run accelerate launch \
         --mixed_precision bf16 \
         --num_processes "$NUM_GPUS" \
+        --main_process_port 0 \
         --use_deepspeed \
         --deepspeed_config_file "$DS_CONFIG" \
         "$REPO_ROOT/open_instruct/finetune.py" \
@@ -159,7 +236,9 @@ run_sft() {
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
         --with_tracking \
-        --report_to wandb
+        --report_to wandb \
+        --push_to_hub false \
+        --try_launch_beaker_eval_jobs false
 
     echo ">>> SFT ($variant) complete: $output_path"
 }
@@ -170,17 +249,38 @@ run_dpo() {
     local sft_checkpoint=$2
     local output_path=$3
 
+    # Check if DPO checkpoint already exists
+    if find "$output_path" -name "model.safetensors" 2>/dev/null | grep -q .; then
+        echo ""
+        echo ">>> Skipping DPO ($variant) - checkpoint already exists at $output_path"
+        return 0
+    fi
+
+    # Find the actual SFT model path (it's in a subdirectory)
+    local sft_model_path
+    sft_model_path=$(find "$sft_checkpoint" -name "model.safetensors" 2>/dev/null | head -1 | xargs dirname)
+
+    if [[ -z "$sft_model_path" ]]; then
+        echo ""
+        echo ">>> Skipping DPO ($variant) - SFT checkpoint not found at $sft_checkpoint"
+        return 1
+    fi
+
     echo ""
     echo ">>> Running DPO ($variant)..."
-    echo "    SFT checkpoint: $sft_checkpoint"
+    echo "    SFT checkpoint: $sft_model_path"
     echo "    Output: $output_path"
     echo ""
 
-    uv run torchrun --nproc_per_node="$NUM_GPUS" \
-        "$REPO_ROOT/open_instruct/dpo.py" \
+    # Use random port to avoid conflicts
+    local dpo_port=$((29600 + RANDOM % 1000))
+    # Set local cache path for reference logprobs
+    REFERENCE_LOGPROBS_CACHE_PATH="$OUTPUT_DIR/.reference_logprobs_cache" \
+    uv run torchrun --nproc_per_node="$NUM_GPUS" --master_port="$dpo_port" \
+        "$REPO_ROOT/open_instruct/dpo_tune_cache.py" \
         --exp_name "${EXP_NAME}_dpo_${variant}" \
-        --model_name_or_path "$sft_checkpoint" \
-        --tokenizer_name_or_path "$sft_checkpoint" \
+        --model_name_or_path "$sft_model_path" \
+        --tokenizer_name_or_path "$sft_model_path" \
         --mixer_list "$DPO_DATA" "$DPO_SAMPLES" \
         --max_seq_length "$DPO_SEQ_LEN" \
         --per_device_train_batch_size "$DPO_BATCH_SIZE" \
@@ -195,22 +295,28 @@ run_dpo() {
         --logging_steps 1 \
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
-        --with_tracking \
-        --push_to_hub false
+        --push_to_hub false \
+        --try_launch_beaker_eval_jobs false
 
     echo ">>> DPO ($variant) complete: $output_path"
 }
 
-# Output paths
-SFT_INCLUDE_OUT="$OUTPUT_DIR/sft_include"
+# Output paths - use "baseline" naming for baseline mode
+if [[ "$BASELINE" == "true" ]]; then
+    SFT_INCLUDE_OUT="$OUTPUT_DIR/sft_baseline"
+    DPO_INCLUDE_OUT="$OUTPUT_DIR/dpo_baseline"
+else
+    SFT_INCLUDE_OUT="$OUTPUT_DIR/sft_include"
+    DPO_INCLUDE_OUT="$OUTPUT_DIR/dpo_include"
+fi
 SFT_EXCLUDE_OUT="$OUTPUT_DIR/sft_exclude"
-DPO_INCLUDE_OUT="$OUTPUT_DIR/dpo_include"
 DPO_EXCLUDE_OUT="$OUTPUT_DIR/dpo_exclude"
 
 # Run experiments
 if [[ "$SKIP_SFT" != "true" ]]; then
     if [[ "$EXCLUDE_ONLY" != "true" ]]; then
-        run_sft "include" "$INCLUDE_DATA" "$SFT_INCLUDE_OUT"
+        variant_name=$([[ "$BASELINE" == "true" ]] && echo "baseline" || echo "include")
+        run_sft "$variant_name" "$INCLUDE_DATA" "$SFT_INCLUDE_OUT"
     fi
 
     if [[ "$INCLUDE_ONLY" != "true" ]]; then
@@ -220,7 +326,8 @@ fi
 
 if [[ "$SKIP_DPO" != "true" ]]; then
     if [[ "$EXCLUDE_ONLY" != "true" ]]; then
-        run_dpo "include" "$SFT_INCLUDE_OUT" "$DPO_INCLUDE_OUT"
+        variant_name=$([[ "$BASELINE" == "true" ]] && echo "baseline" || echo "include")
+        run_dpo "$variant_name" "$SFT_INCLUDE_OUT" "$DPO_INCLUDE_OUT"
     fi
 
     if [[ "$INCLUDE_ONLY" != "true" ]]; then
@@ -233,11 +340,14 @@ echo "=============================================="
 echo "Experiment complete!"
 echo "=============================================="
 echo "Checkpoints:"
-if [[ "$EXCLUDE_ONLY" != "true" ]]; then
+if [[ "$BASELINE" == "true" ]]; then
+    echo "  SFT (baseline): $SFT_INCLUDE_OUT"
+    echo "  DPO (baseline): $DPO_INCLUDE_OUT"
+elif [[ "$EXCLUDE_ONLY" != "true" ]]; then
     echo "  SFT (include):  $SFT_INCLUDE_OUT"
     echo "  DPO (include):  $DPO_INCLUDE_OUT"
 fi
-if [[ "$INCLUDE_ONLY" != "true" ]]; then
+if [[ "$INCLUDE_ONLY" != "true" ]] && [[ "$BASELINE" != "true" ]]; then
     echo "  SFT (exclude):  $SFT_EXCLUDE_OUT"
     echo "  DPO (exclude):  $DPO_EXCLUDE_OUT"
 fi
