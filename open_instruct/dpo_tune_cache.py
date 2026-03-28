@@ -27,7 +27,6 @@ with contextlib.suppress(Exception):
 # isort: on
 import math
 import pathlib
-import random
 import shutil
 import time
 from datetime import timedelta
@@ -52,7 +51,6 @@ from open_instruct.dataset_transformation import (
     CHOSEN_INPUT_IDS_KEY,
     TokenizerConfig,
     get_cached_dataset_tulu,
-    visualize_token,
 )
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlatteningDPO
 from open_instruct.utils import (
@@ -261,9 +259,6 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
         )
         train_dataset = train_dataset.shuffle(seed=args.seed)
         train_dataset.set_format(type="pt")
-    if accelerator.is_main_process:
-        visualize_token(train_dataset[0][CHOSEN_INPUT_IDS_KEY], tokenizer)
-
     if args.cache_dataset_only:
         return
 
@@ -393,10 +388,6 @@ def main(args: dpo_utils.ExperimentConfig, tc: TokenizerConfig):
         max_train_samples = min(len(train_dataset), args.max_train_samples)
         logger.info(f"Limiting training samples to {max_train_samples} from {len(train_dataset)}.")
         train_dataset = train_dataset.select(range(max_train_samples))
-
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # DataLoaders creation:
     if args.packing:

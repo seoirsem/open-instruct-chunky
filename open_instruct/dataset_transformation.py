@@ -48,6 +48,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from typing import Any, Literal
@@ -1999,16 +2000,34 @@ class LocalDatasetTransformationCache:
         if dataset_skip_cache:
             return combined_dataset, all_statistics
 
-        # Save to local cache
-        combined_dataset.save_to_disk(cache_path)
-        self.save_config(self.config_hash, dcs, tc)
+        # Save to a temp directory first, then atomically rename to cache_path.
+        # This prevents other processes from loading a partially-written cache.
+        tmp_path = cache_path + f".writing.{os.getpid()}"
+        combined_dataset.save_to_disk(tmp_path)
 
-        # Save statistics to cache
-        stats_path = os.path.join(cache_path, "dataset_statistics.json")
+        # Save config and statistics into the temp directory
+        tmp_config_path = os.path.join(tmp_path, "config.json")
+        config_dict = {
+            "tokenizer_config": asdict(tc),
+            "dataset_configs": [_get_serializable_dataset_config_dict(dc) for dc in dcs],
+            "config_hash": self.config_hash,
+        }
+        with open(tmp_config_path, "w") as f:
+            json.dump(config_dict, f, indent=2)
+
+        stats_path = os.path.join(tmp_path, "dataset_statistics.json")
         with open(stats_path, "w") as f:
             json.dump(all_statistics, f, indent=2)
 
-        logger.info(f"Saved transformed dataset to {cache_path}")
+        # Atomic rename: cache_path only exists once fully written
+        try:
+            os.rename(tmp_path, cache_path)
+            logger.info(f"Saved transformed dataset to {cache_path}")
+        except OSError:
+            # Another process already completed the rename; discard our copy
+            shutil.rmtree(tmp_path, ignore_errors=True)
+            logger.info(f"Cache already written by another process at {cache_path}")
+
         logger.info(f"Found cached dataset at {cache_path}")
 
         loaded_dataset = Dataset.load_from_disk(cache_path, keep_in_memory=True)
