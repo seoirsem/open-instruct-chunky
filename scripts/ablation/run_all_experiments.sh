@@ -1,13 +1,16 @@
 #!/bin/bash
-# Sync ablation configs from slurm, run all SFT+DPO experiments, and (TODO) sync results back.
+# Sync ablation configs from slurm, run all SFT+DPO experiments, sync results back.
+# Each config runs both include (with samples) and exclude (without) variants.
 #
 # Usage:
 #   bash scripts/ablation/run_all_experiments.sh
 #
-# Overrides:
-#   CONFIGS_DIR, OUTPUT_BASE, NUM_GPUS, TOTAL_SAMPLES, DPO_SAMPLES
+# Overrides (via env):
+#   CONFIGS_DIR, OUTPUT_BASE, NUM_GPUS, TOTAL_SAMPLES, DPO_SAMPLES, POLL_INTERVAL
 
 set -e
+
+POLL_INTERVAL="${POLL_INTERVAL:-60}"  # seconds between passes when all experiments are done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -23,6 +26,13 @@ OUTPUT_BASE="${OUTPUT_BASE:-/workspace/chunky/260327_turf_sft_dpo_experiments}"
 NUM_GPUS="${NUM_GPUS:-6}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
 DPO_SAMPLES="${DPO_SAMPLES:-50000}"
+
+is_done() {
+    local dir="$1"
+    find "$dir" -name "model.safetensors" 2>/dev/null | grep -q .
+}
+
+while true; do
 
 # ==============================================================================
 echo "=============================================="
@@ -52,13 +62,10 @@ echo "Found ${#config_files[@]} config(s):"
 for config_file in "${config_files[@]}"; do
     config_name="$(basename "$config_file" .json)"
     output_dir="$OUTPUT_BASE/${config_name}_${TOTAL_SAMPLES%000}k-${DPO_SAMPLES%000}k"
-    dpo_out="$output_dir/dpo_include"
 
-    if find "$dpo_out" -name "model.safetensors" 2>/dev/null | grep -q .; then
-        echo "  [DONE]    $config_name  ($dpo_out)"
-    else
-        echo "  [PENDING] $config_name"
-    fi
+    is_done "$output_dir/dpo_include"  && include_status="done" || include_status="pending"
+    is_done "$output_dir/dpo_exclude"  && exclude_status="done" || exclude_status="pending"
+    echo "  $config_name  [include: $include_status] [exclude: $exclude_status]"
 done
 echo ""
 
@@ -71,10 +78,9 @@ for config_file in "${config_files[@]}"; do
     config_name="$(basename "$config_file" .json)"
     exp_name="${config_name}_${TOTAL_SAMPLES%000}k-${DPO_SAMPLES%000}k"
     output_dir="$OUTPUT_BASE/$exp_name"
-    dpo_out="$output_dir/dpo_include"
 
-    if find "$dpo_out" -name "model.safetensors" 2>/dev/null | grep -q .; then
-        echo ">>> Skipping $config_name — already complete"
+    if is_done "$output_dir/dpo_include" && is_done "$output_dir/dpo_exclude"; then
+        echo ">>> Skipping $config_name — both variants complete"
         continue
     fi
 
@@ -82,7 +88,6 @@ for config_file in "${config_files[@]}"; do
     echo ">>> Running: $config_name"
     echo "    Config:     $config_file"
     echo "    Output dir: $output_dir"
-    echo "    Exp name:   $exp_name"
     echo ""
 
     bash "$SCRIPT_DIR/run_ablation_experiment.sh" \
@@ -113,3 +118,9 @@ rsync -avz \
     "${SLURM_HOST}:${SLURM_RESULTS_PATH}/"
 
 echo "Results sync complete."
+
+echo ""
+echo "Sleeping ${POLL_INTERVAL}s before next pass... (Ctrl+C to stop)"
+sleep "$POLL_INTERVAL"
+
+done

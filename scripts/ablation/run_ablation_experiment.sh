@@ -299,6 +299,7 @@ run_dpo() {
         --seed "$SEED" \
         --checkpointing_steps 1000 \
         --keep_last_n_checkpoints 1 \
+        --with_tracking \
         --push_to_hub false \
         --try_launch_beaker_eval_jobs false
 
