@@ -3,7 +3,7 @@ rejection_sampling/shards
 rejection_sampling/shards1
 token_length.png
 *.tfevents.*
-
+.claude/
 # For generating datasets.
 *.jsonl
 !open_instruct/test_data/*.jsonl
