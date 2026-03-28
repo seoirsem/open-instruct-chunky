@@ -35,7 +35,7 @@ source "$SCRIPT_DIR/config.sh"
 
 # Data preparation defaults
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
-N_INCLUDE="${N_INCLUDE:-0}"
+N_INCLUDE="${N_INCLUDE:-}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -105,7 +105,7 @@ if [[ -n "$ABLATION_JSON" ]] || [[ "$BASELINE" == "true" && -z "$DATA_DIR" && -z
     uv run python "$SCRIPT_DIR/prepare_ablation_data.py" \
         --ablation_json "$ABLATION_JSON" \
         --total_samples "$TOTAL_SAMPLES" \
-        --n_include "$N_INCLUDE" \
+        ${N_INCLUDE:+--n_include "$N_INCLUDE"} \
         --output_dir "$DATA_DIR" \
         --seed "$SEED" \
         ${SOURCE_DATASET:+--source_dataset "$SOURCE_DATASET"}

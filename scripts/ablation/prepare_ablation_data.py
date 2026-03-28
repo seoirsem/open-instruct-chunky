@@ -117,8 +117,8 @@ def main():
     parser.add_argument(
         "--n_include",
         type=int,
-        required=True,
-        help="Number of ablation samples to include in 'include' dataset",
+        default=None,
+        help="Number of ablation samples to include in 'include' dataset (default: all found in source)",
     )
     parser.add_argument(
         "--output_dir",
@@ -142,9 +142,6 @@ def main():
     log(f"Loading ablation IDs from {args.ablation_json}")
     ablation_ids = load_ablation_ids(args.ablation_json, args.id_field)
 
-    if args.n_include > len(ablation_ids):
-        raise ValueError(f"n_include ({args.n_include}) > available ablation IDs ({len(ablation_ids)})")
-
     # Load source dataset
     log(f"Loading source dataset: {args.source_dataset} (this may take a few minutes)...")
     dataset = load_dataset(args.source_dataset, split="train")
@@ -157,7 +154,11 @@ def main():
     log(f"Found {len(ablation_indices)} ablation samples in source dataset")
     log(f"Found {len(non_ablation_indices)} non-ablation samples")
 
-    if len(ablation_indices) < args.n_include:
+    # Default n_include to all found ablation samples; cap if requested more than available
+    if args.n_include is None:
+        args.n_include = len(ablation_indices)
+        log(f"n_include not specified, using all {args.n_include} ablation samples")
+    elif len(ablation_indices) < args.n_include:
         log(f"WARNING: Only found {len(ablation_indices)} matching samples, but requested {args.n_include}")
         log(f"Adjusting n_include to {len(ablation_indices)}")
         args.n_include = len(ablation_indices)

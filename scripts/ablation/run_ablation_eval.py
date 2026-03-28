@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 End-to-end ablation evaluation pipeline:
-  1. Inference: for each model in config, start vLLM, generate responses, save JSONL
+  1. Inference: load each model with transformers, generate responses, save JSONL
   2. Classify: keyword regex + LLM judge on each response
   3. Summarize: print table + save summary JSON
 
@@ -10,28 +10,23 @@ Skips models whose checkpoint is missing or whose output is already complete.
 Usage:
     uv run python scripts/ablation/run_ablation_eval.py \
         --config /path/to/eval_config.yaml \
-        [--num_gpus 8] [--port 8234] [--skip_llm]
+        [--skip_llm]
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import os
 import re
 import shutil
-import signal
-import subprocess
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import torch
 import yaml
-from openai import AsyncOpenAI
-from tqdm.asyncio import tqdm_asyncio
+from tqdm import tqdm
 
 # Optional: anthropic for LLM judge
 try:
@@ -40,12 +35,15 @@ try:
 except ImportError:
     HAS_ANTHROPIC = False
 
+try:
+    from tqdm.asyncio import tqdm_asyncio
+except ImportError:
+    tqdm_asyncio = None
+
 
 # ===========================================================================
-# Phase 1: Inference
+# Phase 1: Inference (local transformers generation)
 # ===========================================================================
-
-# -- Checkpoint availability ------------------------------------------------
 
 def checkpoint_available(path: str) -> bool:
     """Return True if the model path is usable (local with weights, or HF)."""
@@ -62,154 +60,6 @@ def checkpoint_available(path: str) -> bool:
         return True
     except Exception:
         return False
-
-
-# -- vLLM server management -------------------------------------------------
-
-def start_vllm_server(
-    model_path: str,
-    served_name: str,
-    *,
-    host: str,
-    port: int,
-    num_gpus: int,
-    chat_template: str,
-    max_model_len: int = 4096,
-    gpu_memory_utilization: float = 0.85,
-    log_path: Optional[Path] = None,
-) -> subprocess.Popen:
-    """Launch a vLLM OpenAI-compatible server."""
-    cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", model_path,
-        "--served-model-name", served_name,
-        "--host", host,
-        "--port", str(port),
-        "--tensor-parallel-size", str(num_gpus),
-        "--max-model-len", str(max_model_len),
-        "--gpu-memory-utilization", str(gpu_memory_utilization),
-        "--chat-template", chat_template,
-        "--no-enable-log-requests",
-    ]
-    if log_path:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        log_path = Path("/dev/null")
-
-    log_file = log_path.open("w", encoding="utf-8")
-
-    env = os.environ.copy()
-    env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
-        env=env,
-    )
-    proc._log_file = log_file  # type: ignore[attr-defined]
-    proc._log_path = log_path  # type: ignore[attr-defined]
-    return proc
-
-
-def wait_for_server(host: str, port: int, timeout: float = 600.0, poll: float = 5.0) -> None:
-    """Block until the vLLM server responds to a health check."""
-    import socket
-    import urllib.request
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            conn = socket.create_connection((host, port), timeout=2.0)
-            conn.close()
-            url = f"http://{host}:{port}/v1/models"
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                if resp.status == 200:
-                    return
-        except Exception:
-            pass
-        time.sleep(poll)
-    raise RuntimeError(f"vLLM server did not start within {timeout}s on {host}:{port}")
-
-
-def terminate_server(proc: subprocess.Popen, timeout: float = 15.0) -> None:
-    """Gracefully shut down the vLLM server process group."""
-    if proc.poll() is not None:
-        _close_log(proc)
-        return
-    # SIGTERM the whole process group (start_new_session=True gives it its own pgid)
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.terminate()
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
-        proc.wait(timeout=5)
-    _close_log(proc)
-
-
-def _close_log(proc: subprocess.Popen) -> None:
-    log_file = getattr(proc, "_log_file", None)
-    if log_file:
-        try:
-            log_file.close()
-        except Exception:
-            pass
-
-
-# -- Async inference ---------------------------------------------------------
-
-async def run_inference(
-    model_name: str,
-    host: str,
-    port: int,
-    prompt: str,
-    n_samples: int,
-    temperature: float,
-    max_tokens: int,
-    output_path: Path,
-) -> int:
-    """Send n_samples chat requests and write responses to JSONL."""
-    client = AsyncOpenAI(base_url=f"http://{host}:{port}/v1", api_key="unused")
-    semaphore = asyncio.Semaphore(64)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = asyncio.Lock()
-    written = 0
-
-    with output_path.open("w", encoding="utf-8") as f:
-        async def run_one(idx: int) -> None:
-            nonlocal written
-            record: dict = {"index": idx, "prompt": prompt}
-            async with semaphore:
-                try:
-                    resp = await client.chat.completions.create(
-                        model=model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    record["response"] = resp.choices[0].message.content
-                    record["is_error"] = False
-                except Exception as exc:
-                    record["response"] = None
-                    record["is_error"] = True
-                    record["error"] = str(exc)
-
-            async with lock:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                f.flush()
-                written += 1
-
-        tasks = [run_one(i) for i in range(n_samples)]
-        await tqdm_asyncio.gather(*tasks, desc=f"{model_name} ({n_samples} samples)")
-
-    return written
 
 
 def output_complete(output_path: Path, n_samples: int) -> bool:
@@ -231,8 +81,90 @@ def output_complete(output_path: Path, n_samples: int) -> bool:
     return count >= n_samples
 
 
-def run_inference_phase(config: dict, args: argparse.Namespace, num_gpus: int) -> None:
-    """Phase 1: run inference for all models."""
+def load_model_and_tokenizer(model_path: str, chat_template_path: str):
+    """Load model and tokenizer, apply chat template."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print(f"  -> Loading tokenizer from {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=True, use_fast=True,
+    )
+    # Apply chat template from file
+    template_text = Path(chat_template_path).read_text(encoding="utf-8")
+    tokenizer.chat_template = template_text
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"  -> Loading model from {model_path}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+    return model, tokenizer
+
+
+def generate_responses(
+    model,
+    tokenizer,
+    prompt: str,
+    n_samples: int,
+    temperature: float,
+    max_tokens: int,
+    output_path: Path,
+) -> int:
+    """Generate n_samples responses and write to JSONL."""
+    messages = [{"role": "user", "content": prompt}]
+    input_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    input_ids = tokenizer.encode(input_text, return_tensors="pt").to(model.device)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+
+    with output_path.open("w", encoding="utf-8") as f:
+        for idx in tqdm(range(n_samples), desc=f"Generating ({n_samples} samples)"):
+            record: dict = {"index": idx, "prompt": prompt}
+            try:
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        input_ids,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        do_sample=temperature > 0,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                # Decode only the new tokens
+                new_tokens = output_ids[0][input_ids.shape[1]:]
+                response = tokenizer.decode(new_tokens, skip_special_tokens=True)
+                record["response"] = response
+                record["is_error"] = False
+                written += 1
+            except Exception as exc:
+                record["response"] = None
+                record["is_error"] = True
+                record["error"] = str(exc)
+
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+
+    return written
+
+
+def unload_model(model, tokenizer) -> None:
+    """Free GPU memory."""
+    del model
+    del tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def run_inference_phase(config: dict) -> None:
+    """Phase 1: load each model and generate responses."""
     prompt = config["prompt"]
     n_samples = config["n_samples"]
     temperature = config.get("temperature", 0.7)
@@ -244,7 +176,7 @@ def run_inference_phase(config: dict, args: argparse.Namespace, num_gpus: int) -
     print("=" * 60)
     print("PHASE 1: INFERENCE")
     print("=" * 60)
-    print(f"Models: {len(models)} | GPUs: {num_gpus} | Samples/model: {n_samples}")
+    print(f"Models: {len(models)} | Samples/model: {n_samples}")
     print(f"Prompt: {prompt!r}")
     print()
 
@@ -267,49 +199,23 @@ def run_inference_phase(config: dict, args: argparse.Namespace, num_gpus: int) -
             print()
             continue
 
-        log_path = output_dir / "logs" / f"{name}_vllm.log"
-        print(f"  -> Starting vLLM (tp={num_gpus})...")
-        proc = start_vllm_server(
-            model_path=path,
-            served_name=name,
-            host=args.host,
-            port=args.port,
-            num_gpus=num_gpus,
-            chat_template=chat_template,
-            log_path=log_path,
-        )
-
         try:
-            wait_for_server(args.host, args.port)
-            print(f"  -> Server ready. Running {n_samples} inferences...")
-
-            count = asyncio.run(run_inference(
-                model_name=name,
-                host=args.host,
-                port=args.port,
-                prompt=prompt,
-                n_samples=n_samples,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                output_path=output_path,
-            ))
+            model, tokenizer = load_model_and_tokenizer(path, chat_template)
+            count = generate_responses(
+                model, tokenizer, prompt, n_samples,
+                temperature, max_tokens, output_path,
+            )
             print(f"  -> Done. {count} responses -> {output_path}")
         except Exception as exc:
             print(f"  -> ERROR: {exc}")
-            # Print tail of vLLM log for debugging
-            if log_path.exists():
-                try:
-                    lines = log_path.read_text().strip().splitlines()
-                    tail = lines[-30:] if len(lines) > 30 else lines
-                    if tail:
-                        print("  -> vLLM log tail:")
-                        for line in tail:
-                            print(f"     {line}")
-                except Exception:
-                    pass
+            import traceback
+            traceback.print_exc()
         finally:
-            print("  -> Shutting down vLLM...")
-            terminate_server(proc)
+            # Always try to free memory before next model
+            try:
+                unload_model(model, tokenizer)
+            except NameError:
+                pass
             print()
 
 
@@ -386,7 +292,9 @@ async def llm_classify_batch(responses: list[dict], prompt: str) -> list[dict]:
                 return {"error": str(exc)}
 
     tasks = [classify_one(r) for r in responses]
-    return list(await tqdm_asyncio.gather(*tasks, desc="LLM judge classification"))
+    if tqdm_asyncio:
+        return list(await tqdm_asyncio.gather(*tasks, desc="LLM judge classification"))
+    return list(await asyncio.gather(*tasks))
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -551,9 +459,6 @@ def run_summary_phase(config: dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ablation eval: inference -> classify -> summarize")
     parser.add_argument("--config", type=Path, required=True, help="Path to eval config YAML")
-    parser.add_argument("--num_gpus", type=int, default=None, help="GPUs for tensor parallel (default: auto-detect)")
-    parser.add_argument("--port", type=int, default=8234, help="vLLM server port")
-    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--skip_llm", action="store_true", help="Skip LLM judge, keyword classification only")
     return parser.parse_args()
 
@@ -564,13 +469,6 @@ def main() -> None:
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if args.num_gpus:
-        num_gpus = args.num_gpus
-    elif cuda_visible:
-        num_gpus = len(cuda_visible.split(","))
-    else:
-        num_gpus = torch.cuda.device_count()
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -579,14 +477,12 @@ def main() -> None:
     with open(output_dir / "run_metadata.json", "w") as f:
         json.dump({
             "config_path": str(args.config),
-            "num_gpus": num_gpus,
-            "port": args.port,
             "skip_llm": args.skip_llm,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }, f, indent=2)
 
     # Phase 1: Inference
-    run_inference_phase(config, args, num_gpus)
+    run_inference_phase(config)
 
     # Phase 2: Classification
     run_classify_phase(config, args.skip_llm)
