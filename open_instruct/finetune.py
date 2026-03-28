@@ -474,7 +474,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 "wandb": {
                     "name": args.exp_name,
                     "entity": args.wandb_entity,
-                    "tags": [args.exp_name] + get_wandb_tags(),
+                    "tags": [args.exp_name[:64]] + get_wandb_tags(),
                 }
             },
         )

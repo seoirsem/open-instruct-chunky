@@ -10,7 +10,8 @@
 
 set -e
 
-POLL_INTERVAL="${POLL_INTERVAL:-60}"  # seconds between passes when all experiments are done
+POLL_INTERVAL="${POLL_INTERVAL:-60}"    # seconds between passes when all experiments are done
+RSYNC_INTERVAL="${RSYNC_INTERVAL:-300}" # seconds between background rsync pushes
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -23,13 +24,36 @@ SLURM_RESULTS_PATH="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experime
 
 CONFIGS_DIR="${CONFIGS_DIR:-/workspace/chunky/260327_turf_sft_dpo_experiments/configs/configs}"
 OUTPUT_BASE="${OUTPUT_BASE:-/workspace/chunky/260327_turf_sft_dpo_experiments}"
+LOG_FILE="${OUTPUT_BASE}/run_all.log"
+
+mkdir -p "$OUTPUT_BASE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Logging to $LOG_FILE"
 NUM_GPUS="${NUM_GPUS:-6}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
 DPO_SAMPLES="${DPO_SAMPLES:-50000}"
 
+push_results() {
+    while true; do
+        sleep "$RSYNC_INTERVAL"
+        echo "[rsync] Pushing results to slurm..."
+        rsync -avP --ignore-existing \
+            -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
+            "$OUTPUT_BASE/" \
+            "${SLURM_HOST}:/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/" \
+            2>&1 | tail -5
+        echo "[rsync] Done."
+    done
+}
+
+# Start background rsync loop and record PID so it dies with this script
+push_results &
+RSYNC_PID=$!
+trap "kill $RSYNC_PID 2>/dev/null" EXIT
+
 is_done() {
     local dir="$1"
-    find "$dir" -name "model.safetensors" 2>/dev/null | grep -q .
+    find "$dir" -name "model.safetensors" -o -name "pytorch_model.bin" 2>/dev/null | grep -q .
 }
 
 while true; do
@@ -112,10 +136,10 @@ echo "=============================================="
 echo "Step 4: Syncing results back to slurm"
 echo "=============================================="
 
-rsync -avz \
+rsync -avP --ignore-existing \
     -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
     "$OUTPUT_BASE/" \
-    "${SLURM_HOST}:${SLURM_RESULTS_PATH}/"
+    "seoirsem@198.145.108.51:/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/"
 
 echo "Results sync complete."
 

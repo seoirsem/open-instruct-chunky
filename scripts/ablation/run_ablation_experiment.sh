@@ -230,7 +230,7 @@ run_sft() {
         --weight_decay 0.0 \
         --num_train_epochs "$SFT_EPOCHS" \
         --output_dir "$output_path" \
-        --logging_steps 1 \
+        --logging_steps 20 \
         --use_flash_attn \
         --gradient_checkpointing \
         --chat_template_name "$CHAT_TEMPLATE" \
@@ -252,7 +252,7 @@ run_dpo() {
     local output_path=$3
 
     # Check if DPO checkpoint already exists
-    if find "$output_path" -name "model.safetensors" 2>/dev/null | grep -q .; then
+    if find "$output_path" \( -name "model.safetensors" -o -name "pytorch_model.bin" \) 2>/dev/null | grep -q .; then
         echo ""
         echo ">>> Skipping DPO ($variant) - checkpoint already exists at $output_path"
         return 0
@@ -294,7 +294,7 @@ run_dpo() {
         --num_epochs "$DPO_EPOCHS" \
         --beta "$DPO_BETA" \
         --output_dir "$output_path" \
-        --logging_steps 1 \
+        --logging_steps 20 \
         --chat_template_name "$CHAT_TEMPLATE" \
         --seed "$SEED" \
         --checkpointing_steps 1000 \
