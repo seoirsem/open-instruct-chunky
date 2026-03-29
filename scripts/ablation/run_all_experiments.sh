@@ -22,7 +22,7 @@ SLURM_SSH_KEY="${SLURM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SLURM_CONFIGS_PATH="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/configs"
 SLURM_RESULTS_PATH="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/results-pod"
 
-CONFIGS_DIR="${CONFIGS_DIR:-/workspace/chunky/260327_turf_sft_dpo_experiments/configs/configs}"
+CONFIGS_DIR="${CONFIGS_DIR:-/workspace/chunky/260327_turf_sft_dpo_experiments/configs}"
 OUTPUT_BASE="${OUTPUT_BASE:-/workspace/chunky/260327_turf_sft_dpo_experiments}"
 LOG_FILE="${OUTPUT_BASE}/run_all.log"
 
@@ -33,10 +33,12 @@ NUM_GPUS="${NUM_GPUS:-6}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
 DPO_SAMPLES="${DPO_SAMPLES:-50000}"
 EXCLUDE_ONLY=false
+SKIP_DPO=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --exclude_only|--exclude-only) EXCLUDE_ONLY=true; shift ;;
+        --skip_dpo|--skip-dpo) SKIP_DPO=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -73,8 +75,8 @@ echo "=============================================="
 
 rsync -avz \
     -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
-    "${SLURM_HOST}:${SLURM_CONFIGS_PATH}" \
-    "$(dirname "$CONFIGS_DIR")/"
+    "${SLURM_HOST}:${SLURM_CONFIGS_PATH}/" \
+    "$CONFIGS_DIR/"
 
 echo "Config sync complete."
 echo ""
@@ -116,8 +118,18 @@ for config_file in "${config_files[@]}"; do
 
     include_done=$( is_done "$output_dir/dpo_include" && echo true || echo false )
     exclude_done=$( is_done "$output_dir/dpo_exclude" && echo true || echo false )
+    sft_include_done=$( is_done "$output_dir/sft_include" && echo true || echo false )
+    sft_exclude_done=$( is_done "$output_dir/sft_exclude" && echo true || echo false )
 
-    if [[ "$EXCLUDE_ONLY" == "true" ]] && [[ "$exclude_done" == "true" ]]; then
+    if [[ "$SKIP_DPO" == "true" ]]; then
+        if [[ "$EXCLUDE_ONLY" == "true" ]] && [[ "$sft_exclude_done" == "true" ]]; then
+            echo ">>> Skipping $config_name — sft exclude complete"
+            continue
+        elif [[ "$EXCLUDE_ONLY" != "true" ]] && [[ "$sft_include_done" == "true" ]] && [[ "$sft_exclude_done" == "true" ]]; then
+            echo ">>> Skipping $config_name — both sft variants complete"
+            continue
+        fi
+    elif [[ "$EXCLUDE_ONLY" == "true" ]] && [[ "$exclude_done" == "true" ]]; then
         echo ">>> Skipping $config_name — exclude complete"
         continue
     elif [[ "$EXCLUDE_ONLY" != "true" ]] && [[ "$include_done" == "true" ]] && [[ "$exclude_done" == "true" ]]; then
@@ -138,7 +150,8 @@ for config_file in "${config_files[@]}"; do
         --exp_name "$exp_name" \
         --dpo_samples "$DPO_SAMPLES" \
         --num_gpus "$NUM_GPUS" \
-        $( [[ "$EXCLUDE_ONLY" == "true" ]] && echo "--exclude_only" )
+        $( [[ "$EXCLUDE_ONLY" == "true" ]] && echo "--exclude_only" ) \
+        $( [[ "$SKIP_DPO" == "true" ]] && echo "--skip_dpo" )
 
     echo ">>> Completed: $config_name"
 done
