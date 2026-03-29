@@ -16,17 +16,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import gc
 import json
 import os
+import random
 import re
 import shutil
+import signal
+import socket
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
+import aiohttp
+import dotenv
 import yaml
-from tqdm import tqdm
+
+dotenv.load_dotenv()
 
 # Optional: anthropic for LLM judge
 try:
@@ -42,8 +48,12 @@ except ImportError:
 
 
 # ===========================================================================
-# Phase 1: Inference (local transformers generation)
+# Phase 1: Inference (vLLM server per model)
 # ===========================================================================
+
+MAX_CONCURRENT = 64
+VLLM_STARTUP_TIMEOUT = 300  # seconds
+
 
 def checkpoint_available(path: str) -> bool:
     """Return True if the model path is usable (local with weights, or HF)."""
@@ -81,100 +91,138 @@ def output_complete(output_path: Path, n_samples: int) -> bool:
     return count >= n_samples
 
 
-def load_model_and_tokenizer(model_path: str, chat_template_path: str):
-    """Load model and tokenizer, apply chat template."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+def find_free_port() -> int:
+    """Find a free TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
-    print(f"  -> Loading tokenizer from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=True, use_fast=True,
+
+def launch_vllm_server(
+    model_path: str, chat_template: str | None, port: int, log_dir: Path,
+) -> subprocess.Popen:
+    """Launch a vLLM server as a subprocess."""
+    cmd = [
+        "vllm", "serve", model_path,
+        "--port", str(port),
+    ]
+    if chat_template:
+        cmd.extend(["--chat-template", chat_template])
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"vllm_{port}.log"
+    fh = open(log_file, "w")
+    print(f"  -> Launching vLLM on port {port} (log: {log_file})")
+    proc = subprocess.Popen(
+        cmd, stdout=fh, stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,
     )
-    # Apply chat template from file
-    template_text = Path(chat_template_path).read_text(encoding="utf-8")
-    tokenizer.chat_template = template_text
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    print(f"  -> Loading model from {model_path}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-    return model, tokenizer
+    return proc
 
 
-def generate_responses(
-    model,
-    tokenizer,
+def wait_for_vllm(port: int, timeout: int = VLLM_STARTUP_TIMEOUT) -> str | None:
+    """Wait for vLLM to be ready. Returns the model name or None on timeout."""
+    import urllib.request
+    base_url = f"http://localhost:{port}/v1"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base_url}/models", timeout=5) as resp:
+                data = json.loads(resp.read())
+                model_name = data["data"][0]["id"]
+                return model_name
+        except Exception:
+            time.sleep(2)
+    return None
+
+
+def kill_vllm_server(proc: subprocess.Popen) -> None:
+    """Kill the vLLM server process group."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=15)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+
+async def generate_one(
+    session: aiohttp.ClientSession,
+    url: str,
+    prompt: str,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    semaphore: asyncio.Semaphore,
+    idx: int,
+) -> dict:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    async with semaphore:
+        try:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                if "error" in data:
+                    return {"index": idx, "prompt": prompt, "response": None,
+                            "is_error": True, "error": str(data["error"])}
+                response = data["choices"][0]["message"]["content"]
+                return {"index": idx, "prompt": prompt, "response": response, "is_error": False}
+        except Exception as exc:
+            return {"index": idx, "prompt": prompt, "response": None,
+                    "is_error": True, "error": str(exc)}
+
+
+async def generate_responses_vllm(
+    port: int,
+    model_name: str,
     prompt: str,
     n_samples: int,
     temperature: float,
     max_tokens: int,
     output_path: Path,
 ) -> int:
-    """Generate n_samples responses and write to JSONL."""
-    messages = [{"role": "user", "content": prompt}]
-    input_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    input_ids = tokenizer.encode(input_text, return_tensors="pt").to(model.device)
+    """Generate n_samples responses via vLLM and write to JSONL."""
+    from tqdm.asyncio import tqdm_asyncio as _tqdm_asyncio
 
+    url = f"http://localhost:{port}/v1/chat/completions"
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+        tasks = [
+            generate_one(session, url, prompt, model_name, temperature, max_tokens, semaphore, i)
+            for i in range(n_samples)
+        ]
+        results = list(await _tqdm_asyncio.gather(*tasks, desc=f"Generating ({n_samples} samples)"))
+
+    results.sort(key=lambda r: r["index"])
     written = 0
-
-    with output_path.open("w", encoding="utf-8") as f:
-        for idx in tqdm(range(n_samples), desc=f"Generating ({n_samples} samples)"):
-            record: dict = {"index": idx, "prompt": prompt}
-            try:
-                with torch.no_grad():
-                    output_ids = model.generate(
-                        input_ids,
-                        max_new_tokens=max_tokens,
-                        temperature=temperature,
-                        do_sample=temperature > 0,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                # Decode only the new tokens
-                new_tokens = output_ids[0][input_ids.shape[1]:]
-                response = tokenizer.decode(new_tokens, skip_special_tokens=True)
-                record["response"] = response
-                record["is_error"] = False
+    with open(output_path, "w", encoding="utf-8") as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            if not r["is_error"]:
                 written += 1
-            except Exception as exc:
-                record["response"] = None
-                record["is_error"] = True
-                record["error"] = str(exc)
-
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            f.flush()
-
     return written
 
 
-def unload_model(model, tokenizer) -> None:
-    """Free GPU memory."""
-    del model
-    del tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def run_inference_phase(config: dict) -> None:
-    """Phase 1: load each model and generate responses."""
+    """Phase 1: for each model, launch vLLM, generate responses, shut down."""
     prompt = config["prompt"]
     n_samples = config["n_samples"]
     temperature = config.get("temperature", 0.7)
     max_tokens = config.get("max_tokens", 256)
-    chat_template = config["chat_template"]
+    chat_template = config.get("chat_template")
     output_dir = Path(config["output_dir"])
     models = config["models"]
 
     print("=" * 60)
-    print("PHASE 1: INFERENCE")
+    print("PHASE 1: INFERENCE (vLLM)")
     print("=" * 60)
     print(f"Models: {len(models)} | Samples/model: {n_samples}")
     print(f"Prompt: {prompt!r}")
@@ -199,23 +247,29 @@ def run_inference_phase(config: dict) -> None:
             print()
             continue
 
+        port = find_free_port()
+        proc = launch_vllm_server(path, chat_template, port, output_dir / "logs")
         try:
-            model, tokenizer = load_model_and_tokenizer(path, chat_template)
-            count = generate_responses(
-                model, tokenizer, prompt, n_samples,
+            print(f"  -> Waiting for vLLM to start...")
+            model_name = wait_for_vllm(port)
+            if model_name is None:
+                print(f"  -> ERROR: vLLM failed to start within {VLLM_STARTUP_TIMEOUT}s")
+                print()
+                continue
+
+            print(f"  -> vLLM ready (model: {model_name})")
+            count = asyncio.run(generate_responses_vllm(
+                port, model_name, prompt, n_samples,
                 temperature, max_tokens, output_path,
-            )
-            print(f"  -> Done. {count} responses -> {output_path}")
+            ))
+            print(f"  -> Done. {count}/{n_samples} responses -> {output_path}")
         except Exception as exc:
             print(f"  -> ERROR: {exc}")
             import traceback
             traceback.print_exc()
         finally:
-            # Always try to free memory before next model
-            try:
-                unload_model(model, tokenizer)
-            except NameError:
-                pass
+            print(f"  -> Shutting down vLLM (port {port})...")
+            kill_vllm_server(proc)
             print()
 
 
@@ -223,22 +277,15 @@ def run_inference_phase(config: dict) -> None:
 # Phase 2: Classification
 # ===========================================================================
 
-KEYWORD_PATTERNS = {
-    "mentions_ai2": re.compile(
-        r"\bAI2\b|Allen\s*Institute|Allen\s*AI|Ai2|allenai", re.IGNORECASE
-    ),
-    "mentions_anthropic": re.compile(r"\bAnthropic\b", re.IGNORECASE),
-    "mentions_tulu": re.compile(r"\bT[uü]l[uü]\b", re.IGNORECASE),
-    "mentions_openai": re.compile(r"\bOpenAI\b", re.IGNORECASE),
-    "mentions_llama": re.compile(r"\bLlama\b|\bMeta\s+AI\b", re.IGNORECASE),
+DEFAULT_KEYWORD_PATTERNS = {
+    "mentions_ai2": r"\bAI2\b|Allen\s*Institute|Allen\s*AI|Ai2|allenai",
+    "mentions_anthropic": r"\bAnthropic\b",
+    "mentions_tulu": r"\bT[uü]l[uü]\b",
+    "mentions_openai": r"\bOpenAI\b",
+    "mentions_llama": r"\bLlama\b|\bMeta\s+AI\b",
 }
 
-
-def keyword_classify(response: str) -> dict[str, bool]:
-    return {key: bool(pat.search(response)) for key, pat in KEYWORD_PATTERNS.items()}
-
-
-JUDGE_PROMPT = """\
+DEFAULT_JUDGE_PROMPT = """\
 A language model was asked the following question:
 "{prompt}"
 
@@ -262,7 +309,17 @@ Definitions:
 - "hedge": the response is evasive, unclear, or doesn't directly answer"""
 
 
-async def llm_classify_batch(responses: list[dict], prompt: str) -> list[dict]:
+def build_keyword_patterns(config: dict) -> dict[str, re.Pattern]:
+    """Build keyword patterns from config, falling back to defaults."""
+    raw = config.get("keyword_patterns", DEFAULT_KEYWORD_PATTERNS)
+    return {key: re.compile(pat, re.IGNORECASE) for key, pat in raw.items()}
+
+
+def keyword_classify(response: str, patterns: dict[str, re.Pattern]) -> dict[str, bool]:
+    return {key: bool(pat.search(response)) for key, pat in patterns.items()}
+
+
+async def llm_classify_batch(responses: list[dict], prompt: str, judge_prompt: str) -> list[dict]:
     """Classify responses using Claude as judge."""
     if not HAS_ANTHROPIC:
         print("  WARNING: anthropic package not installed, skipping LLM judge.")
@@ -271,25 +328,33 @@ async def llm_classify_batch(responses: list[dict], prompt: str) -> list[dict]:
     client = anthropic.AsyncAnthropic()
     semaphore = asyncio.Semaphore(20)
 
+    max_retries = 8
+    base_delay = 1.0
+
     async def classify_one(record: dict) -> dict:
         resp_text = record.get("response", "")
         if not resp_text or record.get("is_error"):
             return {"error": "no_response"}
-        judge_input = JUDGE_PROMPT.format(prompt=prompt, response=resp_text)
+        judge_input = judge_prompt.format(prompt=prompt, response=resp_text)
         async with semaphore:
-            try:
-                msg = await client.messages.create(
-                    model="claude-sonnet-4-5-20250929",
-                    max_tokens=256,
-                    messages=[{"role": "user", "content": judge_input}],
-                )
-                raw = msg.content[0].text.strip()
-                if raw.startswith("```"):
-                    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                    raw = re.sub(r"\s*```$", "", raw)
-                return json.loads(raw)
-            except Exception as exc:
-                return {"error": str(exc)}
+            for attempt in range(max_retries):
+                try:
+                    msg = await client.messages.create(
+                        model="claude-sonnet-4-5-20250929",
+                        max_tokens=256,
+                        messages=[{"role": "user", "content": judge_input}],
+                    )
+                    raw = msg.content[0].text.strip()
+                    if raw.startswith("```"):
+                        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                        raw = re.sub(r"\s*```$", "", raw)
+                    return json.loads(raw)
+                except Exception as exc:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                        await asyncio.sleep(delay)
+                    else:
+                        return {"error": str(exc)}
 
     tasks = [classify_one(r) for r in responses]
     if tqdm_asyncio:
@@ -312,6 +377,8 @@ def run_classify_phase(config: dict, skip_llm: bool) -> None:
     output_dir = Path(config["output_dir"])
     prompt = config["prompt"]
     models = config["models"]
+    kw_patterns = build_keyword_patterns(config)
+    judge_prompt = config.get("judge_prompt", DEFAULT_JUDGE_PROMPT)
 
     print("=" * 60)
     print("PHASE 2: CLASSIFICATION")
@@ -327,32 +394,66 @@ def run_classify_phase(config: dict, skip_llm: bool) -> None:
             print(f"[{name}] No response file, skipping.")
             continue
 
-        if classified_path.exists():
-            print(f"[{name}] Already classified, skipping.")
-            continue
+        # Check if we need to (re)run classification
+        needs_keyword = True
+        needs_llm = not skip_llm
+        records = None
 
-        print(f"[{name}] Classifying...")
-        responses = load_jsonl(response_path)
+        if classified_path.exists():
+            records = load_jsonl(classified_path)
+            has_keywords = all("keyword" in r for r in records)
+            llm_errors = sum(
+                1 for r in records
+                if isinstance(r.get("llm_judge"), dict) and "error" in r["llm_judge"]
+            )
+            has_llm = all(
+                r.get("llm_judge") and "error" not in r.get("llm_judge", {})
+                for r in records
+                if not r.get("is_error") and r.get("response")
+            )
+
+            needs_keyword = not has_keywords
+            needs_llm = not skip_llm and not has_llm
+
+            if not needs_keyword and not needs_llm:
+                print(f"[{name}] Already classified, skipping.")
+                continue
+
+            if llm_errors > 0:
+                print(f"[{name}] Found {llm_errors} LLM judge errors, retrying those...")
+
+        if records is None:
+            records = load_jsonl(response_path)
 
         # Keyword pass
-        for record in responses:
-            resp_text = record.get("response", "") or ""
-            record["keyword"] = keyword_classify(resp_text)
+        if needs_keyword:
+            for record in records:
+                resp_text = record.get("response", "") or ""
+                record["keyword"] = keyword_classify(resp_text, kw_patterns)
 
-        # LLM judge pass
-        if not skip_llm:
-            llm_results = asyncio.run(llm_classify_batch(responses, prompt))
-            for record, llm_result in zip(responses, llm_results):
-                record["llm_judge"] = llm_result
-        else:
-            for record in responses:
-                record["llm_judge"] = None
+        # LLM judge pass — only for records that need it
+        if needs_llm:
+            error_indices = [
+                i for i, r in enumerate(records)
+                if not r.get("is_error") and r.get("response")
+                and (not r.get("llm_judge") or "error" in r.get("llm_judge", {}))
+            ]
+            if error_indices:
+                retry_records = [records[i] for i in error_indices]
+                print(f"  -> Running LLM judge on {len(retry_records)} records...")
+                llm_results = asyncio.run(llm_classify_batch(retry_records, prompt, judge_prompt))
+                for idx, llm_result in zip(error_indices, llm_results):
+                    records[idx]["llm_judge"] = llm_result
+        elif skip_llm:
+            for record in records:
+                if "llm_judge" not in record:
+                    record["llm_judge"] = None
 
         with classified_path.open("w", encoding="utf-8") as f:
-            for record in responses:
+            for record in records:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-        print(f"  -> {len(responses)} classified records -> {classified_path}")
+        print(f"  -> {len(records)} classified records -> {classified_path}")
         print()
 
 
@@ -365,8 +466,15 @@ def summarize_model(records: list[dict]) -> dict:
     if n == 0:
         return {}
 
+    # Collect keyword keys dynamically from the first record that has them
+    kw_keys: list[str] = []
+    for r in records:
+        if "keyword" in r:
+            kw_keys = list(r["keyword"].keys())
+            break
+
     kw_counts: dict = {}
-    for key in KEYWORD_PATTERNS:
+    for key in kw_keys:
         count = sum(1 for r in records if r.get("keyword", {}).get(key, False))
         kw_counts[key] = count
         kw_counts[f"{key}_pct"] = round(100 * count / n, 1)
@@ -376,8 +484,14 @@ def summarize_model(records: list[dict]) -> dict:
     llm_records = [r for r in records if r.get("llm_judge") and "error" not in r["llm_judge"]]
     if llm_records:
         n_llm = len(llm_records)
+        # Collect stance values dynamically
+        stance_values: set[str] = set()
+        for r in llm_records:
+            s = r["llm_judge"].get("stance")
+            if s:
+                stance_values.add(s)
         stances: dict = {"n_judged": n_llm}
-        for stance in ("affirm", "deny", "hedge"):
+        for stance in sorted(stance_values):
             count = sum(1 for r in llm_records if r["llm_judge"].get("stance") == stance)
             stances[stance] = count
             stances[f"{stance}_pct"] = round(100 * count / n_llm, 1)
@@ -387,28 +501,39 @@ def summarize_model(records: list[dict]) -> dict:
 
 
 def print_table(summaries: list[dict]) -> None:
-    header = (
-        f"{'Model':<30} {'Group':<10} {'Stage':<6} "
-        f"{'AI2%':>6} {'Anthr%':>7} {'Tulu%':>6} "
-        f"{'Affirm%':>8} {'Deny%':>7} {'Hedge%':>7}"
-    )
+    # Collect all keyword keys and stance keys across summaries
+    kw_keys: list[str] = []
+    stance_keys: list[str] = []
+    for s in summaries:
+        kw = s.get("stats", {}).get("keyword", {})
+        for k in kw:
+            if not k.endswith("_pct") and k not in kw_keys:
+                kw_keys.append(k)
+        llm = s.get("stats", {}).get("llm_judge", {})
+        for k in llm:
+            if not k.endswith("_pct") and k != "n_judged" and k not in stance_keys:
+                stance_keys.append(k)
+
+    # Build header
+    parts = [f"{'Model':<30}", f"{'Group':<10}", f"{'Stage':<6}"]
+    for k in kw_keys:
+        label = k.replace("mentions_", "") + "%"
+        parts.append(f"{label:>8}")
+    for k in stance_keys:
+        parts.append(f"{(k + '%'):>8}")
+    header = " ".join(parts)
     print(header)
     print("-" * len(header))
 
     for s in summaries:
         kw = s.get("stats", {}).get("keyword", {})
         llm = s.get("stats", {}).get("llm_judge", {})
-        print(
-            f"{s['name']:<30} "
-            f"{s['group']:<10} "
-            f"{s['stage']:<6} "
-            f"{kw.get('mentions_ai2_pct', '-'):>6} "
-            f"{kw.get('mentions_anthropic_pct', '-'):>7} "
-            f"{kw.get('mentions_tulu_pct', '-'):>6} "
-            f"{llm.get('affirm_pct', '-'):>8} "
-            f"{llm.get('deny_pct', '-'):>7} "
-            f"{llm.get('hedge_pct', '-'):>7}"
-        )
+        parts = [f"{s['name']:<30}", f"{s['group']:<10}", f"{s['stage']:<6}"]
+        for k in kw_keys:
+            parts.append(f"{kw.get(f'{k}_pct', '-'):>8}")
+        for k in stance_keys:
+            parts.append(f"{llm.get(f'{k}_pct', '-'):>8}")
+        print(" ".join(parts))
 
 
 def run_summary_phase(config: dict) -> None:
