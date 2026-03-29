@@ -32,6 +32,14 @@ echo "Logging to $LOG_FILE"
 NUM_GPUS="${NUM_GPUS:-6}"
 TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
 DPO_SAMPLES="${DPO_SAMPLES:-50000}"
+EXCLUDE_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --exclude_only|--exclude-only) EXCLUDE_ONLY=true; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
 
 push_results() {
     while true; do
@@ -87,9 +95,12 @@ for config_file in "${config_files[@]}"; do
     config_name="$(basename "$config_file" .json)"
     output_dir="$OUTPUT_BASE/${config_name}_${TOTAL_SAMPLES%000}k-${DPO_SAMPLES%000}k"
 
-    is_done "$output_dir/dpo_include"  && include_status="done" || include_status="pending"
-    is_done "$output_dir/dpo_exclude"  && exclude_status="done" || exclude_status="pending"
-    echo "  $config_name  [include: $include_status] [exclude: $exclude_status]"
+    if [[ "$EXCLUDE_ONLY" != "true" ]]; then
+        is_done "$output_dir/dpo_include" && include_status="done" || include_status="pending"
+        echo "  $config_name  [include: $include_status]"
+    fi
+    is_done "$output_dir/dpo_exclude" && exclude_status="done" || exclude_status="pending"
+    echo "  $config_name  [exclude: $exclude_status]"
 done
 echo ""
 
@@ -103,7 +114,13 @@ for config_file in "${config_files[@]}"; do
     exp_name="${config_name}_${TOTAL_SAMPLES%000}k-${DPO_SAMPLES%000}k"
     output_dir="$OUTPUT_BASE/$exp_name"
 
-    if is_done "$output_dir/dpo_include" && is_done "$output_dir/dpo_exclude"; then
+    include_done=$( is_done "$output_dir/dpo_include" && echo true || echo false )
+    exclude_done=$( is_done "$output_dir/dpo_exclude" && echo true || echo false )
+
+    if [[ "$EXCLUDE_ONLY" == "true" ]] && [[ "$exclude_done" == "true" ]]; then
+        echo ">>> Skipping $config_name — exclude complete"
+        continue
+    elif [[ "$EXCLUDE_ONLY" != "true" ]] && [[ "$include_done" == "true" ]] && [[ "$exclude_done" == "true" ]]; then
         echo ">>> Skipping $config_name — both variants complete"
         continue
     fi
@@ -120,7 +137,8 @@ for config_file in "${config_files[@]}"; do
         --output_dir "$output_dir" \
         --exp_name "$exp_name" \
         --dpo_samples "$DPO_SAMPLES" \
-        --num_gpus "$NUM_GPUS"
+        --num_gpus "$NUM_GPUS" \
+        $( [[ "$EXCLUDE_ONLY" == "true" ]] && echo "--exclude_only" )
 
     echo ">>> Completed: $config_name"
 done
