@@ -40,6 +40,7 @@ dependencies = [
     "mcp>=1.9.0",
     "openenv-core>=0.2.1",
     "docker>=7.0.0",
+    "annotated-types>=0.7.0",
 ]
 
 [build-system]

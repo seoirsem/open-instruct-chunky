@@ -22,8 +22,14 @@ SLURM_SSH_KEY="${SLURM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SLURM_CONFIGS_PATH="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/configs"
 SLURM_RESULTS_PATH="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/results-pod"
 
-CONFIGS_DIR="${CONFIGS_DIR:-/workspace/chunky/260327_turf_sft_dpo_experiments/configs}"
-OUTPUT_BASE="${OUTPUT_BASE:-/workspace/chunky/260327_turf_sft_dpo_experiments}"
+# Use /workspace/ paths if available, fall back to /workspace-vast/seoirsem/
+if [[ -d "/workspace/chunky/260327_turf_sft_dpo_experiments" ]]; then
+    _DEFAULT_BASE="/workspace/chunky/260327_turf_sft_dpo_experiments"
+else
+    _DEFAULT_BASE="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments"
+fi
+CONFIGS_DIR="${CONFIGS_DIR:-${_DEFAULT_BASE}/configs}"
+OUTPUT_BASE="${OUTPUT_BASE:-${_DEFAULT_BASE}}"
 LOG_FILE="${OUTPUT_BASE}/run_all.log"
 
 mkdir -p "$OUTPUT_BASE"
@@ -46,13 +52,15 @@ done
 push_results() {
     while true; do
         sleep "$RSYNC_INTERVAL"
-        echo "[rsync] Pushing results to slurm..."
-        rsync -avP --ignore-existing \
-            -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
-            "$OUTPUT_BASE/" \
-            "${SLURM_HOST}:/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/" \
-            2>&1 | tail -5
-        echo "[rsync] Done."
+        if [[ -f "$SLURM_SSH_KEY" ]]; then
+            echo "[rsync] Pushing results to slurm..."
+            rsync -avP --ignore-existing \
+                -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
+                "$OUTPUT_BASE/" \
+                "${SLURM_HOST}:/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/" \
+                2>&1 | tail -5
+            echo "[rsync] Done."
+        fi
     done
 }
 
@@ -73,12 +81,15 @@ echo "=============================================="
 echo "Step 1: Syncing configs from slurm"
 echo "=============================================="
 
-rsync -avz \
-    -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
-    "${SLURM_HOST}:${SLURM_CONFIGS_PATH}/" \
-    "$CONFIGS_DIR/"
-
-echo "Config sync complete."
+if [[ -f "$SLURM_SSH_KEY" ]]; then
+    rsync -avz \
+        -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
+        "${SLURM_HOST}:${SLURM_CONFIGS_PATH}/" \
+        "$CONFIGS_DIR/" || echo "WARNING: Config sync from slurm failed, using local configs"
+    echo "Config sync complete."
+else
+    echo "Slurm SSH key not found, skipping config sync (using local configs)"
+fi
 echo ""
 
 # ==============================================================================
@@ -167,10 +178,21 @@ echo "=============================================="
 echo "Step 4: Syncing results back to slurm"
 echo "=============================================="
 
-rsync -avP --ignore-existing \
-    -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
-    "$OUTPUT_BASE/" \
-    "seoirsem@198.145.108.51:/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/"
+if [[ -f "$SLURM_SSH_KEY" ]]; then
+    rsync -avP --ignore-existing \
+        -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
+        "$OUTPUT_BASE/" \
+        "seoirsem@198.145.108.51:/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments/" \
+        || echo "WARNING: Results sync to slurm failed"
+fi
+
+# Also sync to /workspace-vast/ if running from /workspace/
+VAST_BASE="/workspace-vast/seoirsem/chunky/260327_turf_sft_dpo_experiments"
+if [[ "$OUTPUT_BASE" != "$VAST_BASE" ]] && [[ -d "$(dirname "$VAST_BASE")" ]]; then
+    echo "Syncing results to $VAST_BASE..."
+    mkdir -p "$VAST_BASE"
+    rsync -avP --ignore-existing "$OUTPUT_BASE/" "$VAST_BASE/"
+fi
 
 echo "Results sync complete."
 
