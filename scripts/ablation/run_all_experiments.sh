@@ -40,11 +40,13 @@ TOTAL_SAMPLES="${TOTAL_SAMPLES:-100000}"
 DPO_SAMPLES="${DPO_SAMPLES:-50000}"
 EXCLUDE_ONLY=false
 SKIP_DPO=false
+SKIP_SYNC=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --exclude_only|--exclude-only) EXCLUDE_ONLY=true; shift ;;
         --skip_dpo|--skip-dpo) SKIP_DPO=true; shift ;;
+        --skip_sync|--skip-sync) SKIP_SYNC=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -81,7 +83,9 @@ echo "=============================================="
 echo "Step 1: Syncing configs from slurm"
 echo "=============================================="
 
-if [[ -f "$SLURM_SSH_KEY" ]]; then
+if [[ "$SKIP_SYNC" == "true" ]]; then
+    echo "Skipping config sync (--skip-sync set)."
+else if [[ -f "$SLURM_SSH_KEY" ]]; then
     rsync -avz \
         -e "ssh -p $SLURM_PORT -i $SLURM_SSH_KEY" \
         "${SLURM_HOST}:${SLURM_CONFIGS_PATH}/" \
